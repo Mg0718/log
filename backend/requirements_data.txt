@@ -1,0 +1,5 @@
+requests
+geopy
+shapely
+langchain-groq
+pydantic
