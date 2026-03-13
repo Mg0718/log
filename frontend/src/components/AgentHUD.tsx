@@ -2,11 +2,14 @@
 
 import { useEffect, useState } from "react";
 import { useLogisticsStore } from "@/store/useLogisticsStore";
+import { useAuthStore } from "@/store/useAuthStore";
 import { motion, AnimatePresence } from "framer-motion";
 import { Terminal, ShieldAlert, Cpu, Route, CheckCircle2, XCircle } from "lucide-react";
 
 export function AgentHUD() {
   const { activePayload, notifications, sendAgentDecision } = useLogisticsStore();
+  const { role } = useAuthStore();
+  const canApprove = role === "admin";
   const [displayText, setDisplayText] = useState("");
   const fullText = !activePayload
     ? ""
@@ -103,12 +106,12 @@ export function AgentHUD() {
               </div>
 
               {/* Action Buttons if ActionComposer */}
-              {activePayload.agent === "ActionComposer" && (
+              {activePayload.agent === "ActionComposer" && canApprove && (
                 <div className="flex flex-col gap-3 mt-4">
                   {(activePayload.proposed_action.decision_options ?? []).map((option, index) => (
                     <button
                       key={option.id}
-                      onClick={() => sendAgentDecision(activePayload.shipment_id, option.decision as "APPROVE" | "REJECT")}
+                      onClick={() => sendAgentDecision(activePayload.shipment_id, option.decision)}
                       className={index === 0
                         ? "w-full py-4 bg-cyan-500 text-black font-bold uppercase tracking-[0.2em] text-sm hover:bg-cyan-400 transition-all flex items-center justify-center gap-3"
                         : "w-full py-4 bg-transparent border border-red-900/40 text-red-500 font-bold uppercase tracking-[0.2em] text-sm hover:bg-red-500/10 transition-all flex items-center justify-center gap-3"
@@ -118,6 +121,11 @@ export function AgentHUD() {
                       {option.label}
                     </button>
                   ))}
+                </div>
+              )}
+              {activePayload.agent === "ActionComposer" && !canApprove && (
+                <div className="mt-4 p-3 border border-zinc-800 bg-zinc-950/40 text-[10px] text-zinc-400 uppercase tracking-wider">
+                  Admin approval required for route decisions.
                 </div>
               )}
               

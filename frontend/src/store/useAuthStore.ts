@@ -3,7 +3,7 @@ import { persist } from "zustand/middleware";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-export type UserRole = "seller" | "buyer";
+export type UserRole = "admin" | "seller" | "receiver";
 
 interface AuthState {
   token: string | null;

@@ -21,19 +21,32 @@ def _verify(password: str, hashed: bytes) -> bool:
     return bcrypt.checkpw(password.encode(), hashed)
 
 
-# Demo users: two roles — seller (sends/ships goods) and buyer (receives/orders goods)
-# Both roles can perform send and receive operations; role determines primary UI experience.
+# Demo users for the prototype.
+# Roles align with the layered design: admin, seller, receiver.
+# Keep `buyer` as a backward-compatible alias that maps to receiver role.
 _DEMO_USERS: dict[str, dict] = {
+    "admin": {
+        "username": "admin",
+        "role": "admin",
+        "full_name": "Ops Control (Admin)",
+        "hashed_password": _hash("admin123"),
+    },
     "seller": {
         "username": "seller",
         "role": "seller",
         "full_name": "Alice (Seller)",
         "hashed_password": _hash("seller123"),
     },
+    "receiver": {
+        "username": "receiver",
+        "role": "receiver",
+        "full_name": "Bob (Receiver)",
+        "hashed_password": _hash("receiver123"),
+    },
     "buyer": {
         "username": "buyer",
-        "role": "buyer",
-        "full_name": "Bob (Buyer)",
+        "role": "receiver",
+        "full_name": "Bob (Receiver)",
         "hashed_password": _hash("buyer123"),
     },
 }

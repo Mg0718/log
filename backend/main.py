@@ -117,6 +117,16 @@ def get_current_user(
     return payload
 
 
+def require_roles(current_user: dict, allowed_roles: set[str]) -> None:
+    """Guard endpoint access by role for demo RBAC."""
+    role = str(current_user.get("role", "")).lower()
+    if role not in allowed_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{role or 'unknown'}' is not allowed for this action.",
+        )
+
+
 @app.post("/auth/login")
 def auth_login(req: LoginRequest):
     """Authenticate with username and password. Returns a JWT access token."""
@@ -164,6 +174,7 @@ class NotifyStakeholdersRequest(BaseModel):
 
 class SignalInjectRequest(BaseModel):
     signal_type: str = "auto"  # auto | weather | port_congestion | road_closure | customs_delay | civil_unrest
+    target_shipment_id: Optional[str] = None  # If set, disruption is anchored on this shipment's route
 
 
 class AgentDecisionRequest(BaseModel):
@@ -306,6 +317,9 @@ def _reroute_shipment_for_disruption(shipment: Dict[str, Any], disruption: Dict[
 
     # Frontend-friendly ActionComposer payload so HUD shows backend agent output.
     recommended_actions = agent_result.get("recommended_actions", [])
+    action_summary = "; ".join(recommended_actions[:3]).strip()
+    if not action_summary:
+        action_summary = "Approve reroute now; Safe wait 30 min; Escalate to dispatch"
     driver_msg = (
         recommended_actions[0]
         if recommended_actions
@@ -362,7 +376,10 @@ def _reroute_shipment_for_disruption(shipment: Dict[str, Any], disruption: Dict[
             "id": f"NTF-{uuid.uuid4().hex[:6].upper()}",
             "shipment_id": shipment_id,
             "channel": "seller",
-            "message": f"Seller alert: hazard detected for {shipment_id}. AI recommends reroute.",
+            "message": (
+                f"Seller alert: disruption detected for {shipment_id}. "
+                f"AI suggested actions: {action_summary}."
+            ),
             "created_at": int(time.time()),
         }
     )
@@ -371,7 +388,10 @@ def _reroute_shipment_for_disruption(shipment: Dict[str, Any], disruption: Dict[
             "id": f"NTF-{uuid.uuid4().hex[:6].upper()}",
             "shipment_id": shipment_id,
             "channel": "receiver",
-            "message": f"Receiver alert: shipment {shipment_id} may incur delay while mitigation is applied.",
+            "message": (
+                f"Receiver alert: shipment {shipment_id} faces disruption risk. "
+                f"AI suggested mitigation options: {action_summary}."
+            ),
             "created_at": int(time.time()),
         }
     )
@@ -488,6 +508,106 @@ def _set_preview_risk_payload_if_needed() -> None:
             "created_at": int(time.time()),
         }
     )
+    state.notifications.append(
+        {
+            "id": f"NTF-{uuid.uuid4().hex[:6].upper()}",
+            "shipment_id": shipment.get("id"),
+            "channel": "seller",
+            "message": (
+                f"Seller alert: disruption simulated for {shipment.get('id')}. "
+                f"Recommended option: {recommended_option}."
+            ),
+            "created_at": int(time.time()),
+        }
+    )
+    state.notifications.append(
+        {
+            "id": f"NTF-{uuid.uuid4().hex[:6].upper()}",
+            "shipment_id": shipment.get("id"),
+            "channel": "receiver",
+            "message": (
+                f"Receiver alert: shipment {shipment.get('id')} impacted by disruption. "
+                f"Control tower is evaluating actions ({recommended_option})."
+            ),
+            "created_at": int(time.time()),
+        }
+    )
+
+
+def _select_relevant_disruption_for_shipment(shipment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pick the most relevant disruption for a shipment using geospatial risk ranking."""
+    if not state.disruptions:
+        return None
+
+    scored: List[tuple[int, Dict[str, Any]]] = []
+    for disruption in state.disruptions:
+        geo = _compute_geospatial_risk(shipment, disruption)
+        scored.append((int(geo.get("final_risk_score", 0)), disruption))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_disruption = scored[0]
+    if best_score > 0:
+        return best_disruption
+    return state.disruptions[-1]
+
+
+def _build_detour_route(
+    current_lat: float,
+    current_lon: float,
+    destination_coord: tuple[float, float],
+    disruption: Optional[Dict[str, Any]],
+) -> list[tuple[float, float]]:
+    """Create a visibly different fallback detour route via a waypoint around disruption center."""
+    dest_lat, dest_lon = destination_coord
+
+    if disruption is None:
+        return state.knowledge_model.fetch_osrm_route((current_lat, current_lon), destination_coord)
+
+    disruption_lat = float(disruption.get("lat", current_lat))
+    disruption_lon = float(disruption.get("lon", current_lon))
+
+    # Shift waypoint away from disruption to force an alternate corridor.
+    lat_shift = 1.2 if current_lat <= disruption_lat else -1.2
+    lon_shift = 1.2 if current_lon <= disruption_lon else -1.2
+    via_lat = disruption_lat + lat_shift
+    via_lon = disruption_lon + lon_shift
+
+    leg1 = state.knowledge_model.fetch_osrm_route((current_lat, current_lon), (via_lat, via_lon))
+    leg2 = state.knowledge_model.fetch_osrm_route((via_lat, via_lon), (dest_lat, dest_lon))
+
+    if leg1 and leg2:
+        return leg1 + leg2[1:]
+
+    return state.knowledge_model.fetch_osrm_route((current_lat, current_lon), destination_coord)
+
+
+def _apply_operator_reroute(shipment: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply reroute after admin approval and return reroute metadata for notifications."""
+    details = shipment.get("shipment_details", {})
+    destination = details.get("destination")
+    if not destination:
+        return {"applied": False, "reason": "missing_destination"}
+
+    dest_coord = state.knowledge_model._get_city_coords(destination)
+    current_lat = float(shipment.get("currentLat", 20.5937))
+    current_lon = float(shipment.get("currentLon", 78.9629))
+    disruption = _select_relevant_disruption_for_shipment(shipment)
+    new_route = _build_detour_route(current_lat, current_lon, dest_coord, disruption)
+
+    if not new_route:
+        return {"applied": False, "reason": "no_route"}
+
+    shipment["currentRoute"] = new_route
+    shipment["riskScore"] = max(int(shipment.get("riskScore", 0)), 65)
+    if disruption is not None:
+        shipment["lastMitigatedDisruptionId"] = disruption.get("id")
+
+    ontology_graph.update_shipment_route(shipment.get("id"), new_route)
+    return {
+        "applied": True,
+        "disruption_type": (disruption or {}).get("type", "DISRUPTION"),
+        "waypoints": len(new_route),
+    }
 
 # WebSocket manager
 class ConnectionManager:
@@ -589,6 +709,7 @@ async def update_truck_gps(
     request: GPSUpdateRequest,
     current_user: dict = Depends(get_current_user),
 ):
+    require_roles(current_user, {"admin", "seller"})
     shipment = next((s for s in state.shipments if s.get("id") == shipment_id), None)
     if shipment is None:
         return {"status": "error", "message": "shipment not found"}
@@ -613,6 +734,7 @@ async def notify_stakeholders(
     request: NotifyStakeholdersRequest,
     current_user: dict = Depends(get_current_user),
 ):
+    require_roles(current_user, {"admin", "seller"})
     shipment = next((s for s in state.shipments if s.get("id") == shipment_id), None)
     if shipment is None:
         return {"status": "error", "message": "shipment not found"}
@@ -642,6 +764,7 @@ async def notify_stakeholders(
         "created_at": int(time.time()),
     }
     state.notifications.extend([seller_msg, receiver_msg])
+    await manager.broadcast_state()
 
     return {
         "status": "sent",
@@ -655,6 +778,7 @@ async def submit_agent_decision(
     request: AgentDecisionRequest,
     current_user: dict = Depends(get_current_user),
 ):
+    require_roles(current_user, {"admin"})
     shipment = next((s for s in state.shipments if s.get("id") == request.shipment_id), None)
     if shipment is None:
         return {"status": "error", "message": "shipment not found"}
@@ -664,10 +788,14 @@ async def submit_agent_decision(
     if decision not in allowed:
         return {"status": "error", "message": "decision must be one of APPROVE, REJECT, APPROVE_REROUTE, SAFE_WAIT, ESCALATE"}
 
+    reroute_result: Dict[str, Any] = {"applied": False}
+
     if decision in {"REJECT", "SAFE_WAIT"}:
         shipment["riskScore"] = max(0, int(shipment.get("riskScore", 0)) - 10)
     elif decision in {"APPROVE", "APPROVE_REROUTE"}:
-        shipment["riskScore"] = max(int(shipment.get("riskScore", 0)), 65)
+        reroute_result = _apply_operator_reroute(shipment)
+        if not reroute_result.get("applied"):
+            shipment["riskScore"] = max(int(shipment.get("riskScore", 0)), 65)
     elif decision == "ESCALATE":
         shipment["riskScore"] = max(int(shipment.get("riskScore", 0)), 40)
 
@@ -676,7 +804,10 @@ async def submit_agent_decision(
             "id": f"NTF-{uuid.uuid4().hex[:6].upper()}",
             "shipment_id": request.shipment_id,
             "channel": "control_tower",
-            "message": f"Operator decision: {decision}",
+            "message": (
+                f"Operator decision: {decision}. "
+                f"Reroute {'applied' if reroute_result.get('applied') else 'not applied'}"
+            ),
             "created_at": int(time.time()),
         }
     )
@@ -686,7 +817,10 @@ async def submit_agent_decision(
             "id": f"NTF-{uuid.uuid4().hex[:6].upper()}",
             "shipment_id": request.shipment_id,
             "channel": "seller",
-            "message": f"Seller notified: AI decision for {request.shipment_id} is {decision}.",
+            "message": (
+                f"Seller notified: decision for {request.shipment_id} is {decision}. "
+                f"Suggested action executed: {'detour route activated' if reroute_result.get('applied') else 'monitor only'}"
+            ),
             "created_at": int(time.time()),
         }
     )
@@ -695,7 +829,10 @@ async def submit_agent_decision(
             "id": f"NTF-{uuid.uuid4().hex[:6].upper()}",
             "shipment_id": request.shipment_id,
             "channel": "receiver",
-            "message": f"Receiver notified: shipment {request.shipment_id} status updated to {decision}.",
+            "message": (
+                f"Receiver notified: shipment {request.shipment_id} status updated to {decision}. "
+                f"Route {'updated to avoid disruption' if reroute_result.get('applied') else 'unchanged'}"
+            ),
             "created_at": int(time.time()),
         }
     )
@@ -719,6 +856,7 @@ async def schedule_transport(
     current_user: dict = Depends(get_current_user),
 ):
     """Schedule a transport from point A to B and arm autonomous hazard monitoring."""
+    require_roles(current_user, {"admin", "seller"})
     origin = request.origin.strip()
     destination = request.destination.strip()
     if not origin or not destination:
@@ -865,13 +1003,37 @@ async def inject_signal(
     5. Layer 4 — LangGraph AI agents (RiskAnalyst → RouteOptimizer → ActionComposer)
     6. Broadcast results via WebSocket to Cesium frontend
     """
+    require_roles(current_user, {"admin"})
     try:
         logger.info(f"Signal injection triggered — type={body.signal_type} by {current_user.get('sub')}")
 
+        # ── Resolve target shipment (if admin picked one) ────────────────────
+        target_shipment: Optional[Dict[str, Any]] = None
+        if body.target_shipment_id:
+            target_shipment = next(
+                (s for s in state.shipments if s.get("id") == body.target_shipment_id),
+                None,
+            )
+
         # ── Layer 1: signal selection ────────────────────────────────────────
         if body.signal_type in _SIGNAL_SCENARIOS:
-            raw_signals = [_SIGNAL_SCENARIOS[body.signal_type]]
-            logger.info(f"Using synthetic scenario: {body.signal_type}")
+            base_scenario = dict(_SIGNAL_SCENARIOS[body.signal_type])
+            # If a specific shipment is targeted, anchor the disruption midpoint
+            # on that shipment's current route so intersection is guaranteed.
+            if target_shipment is not None:
+                route = target_shipment.get("currentRoute", [])
+                if route:
+                    mid = route[len(route) // 2]
+                    base_scenario["lon"] = float(mid[0])
+                    base_scenario["lat"] = float(mid[1])
+                    origin = target_shipment.get("shipment_details", {}).get("origin", base_scenario.get("location", "route"))
+                    base_scenario["location"] = origin
+                    base_scenario["raw_text"] = (
+                        f"{base_scenario['raw_text']} "
+                        f"Directly impacts shipment {body.target_shipment_id}."
+                    )
+            raw_signals = [base_scenario]
+            logger.info(f"Using synthetic scenario: {body.signal_type} targeted={'yes' if target_shipment else 'no'}")
         else:
             # "auto" — try real API ingestion
             raw_signals = await fetch_all_signals()
@@ -895,8 +1057,18 @@ async def inject_signal(
             _ensure_disruption(disruption_data)
             if len(state.disruptions) > before_count:
                 disruptions_added += 1
-        
-        reroutes = await run_autonomous_monitor_cycle()
+
+        # ── Targeted fast-path: if admin picked a specific shipment,
+        # immediately reroute only that one (skip autonomous scan).
+        if target_shipment is not None and state.disruptions:
+            disruption = state.disruptions[-1]
+            # Reset mitigation lock so the shipment is eligible
+            target_shipment["lastMitigatedDisruptionId"] = None
+            _reroute_shipment_for_disruption(target_shipment, disruption)
+            reroutes = 1
+        else:
+            reroutes = await run_autonomous_monitor_cycle()
+
         _set_preview_risk_payload_if_needed()
         await manager.broadcast_state()
         return {
@@ -904,6 +1076,7 @@ async def inject_signal(
             "signals_processed": len(raw_signals),
             "disruptions_added": disruptions_added,
             "reroutes_applied": reroutes,
+            "targeted_shipment": body.target_shipment_id,
         }
         
     except Exception as e:

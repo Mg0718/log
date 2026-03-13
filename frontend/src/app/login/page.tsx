@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/store/useAuthStore";
-import { Shield, Loader2, Package, ShoppingCart } from "lucide-react";
+import { Shield, Loader2, Package, ShoppingCart, ShieldCheck } from "lucide-react";
 
 export default function LoginPage() {
   const [username, setUsername] = useState("");
@@ -27,9 +27,15 @@ export default function LoginPage() {
     }
   };
 
-  const fillCredentials = (role: "seller" | "buyer") => {
+  const fillCredentials = (role: "admin" | "seller" | "receiver") => {
     setUsername(role);
-    setPassword(role === "seller" ? "seller123" : "buyer123");
+    setPassword(
+      role === "admin"
+        ? "admin123"
+        : role === "seller"
+          ? "seller123"
+          : "receiver123"
+    );
     setError(null);
   };
 
@@ -66,7 +72,18 @@ export default function LoginPage() {
           </div>
 
           {/* Role quick-select */}
-          <div className="flex gap-2">
+          <div className="grid grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={() => fillCredentials("admin")}
+              className="flex-1 flex flex-col items-center gap-1.5 p-3 border border-emerald-900/40 bg-emerald-950/10 hover:bg-emerald-950/30 hover:border-emerald-600/50 transition-all group"
+            >
+              <ShieldCheck className="w-4 h-4 text-emerald-600 group-hover:text-emerald-400" />
+              <span className="text-[9px] text-emerald-600 group-hover:text-emerald-400 uppercase tracking-widest font-bold">
+                Admin
+              </span>
+              <span className="text-[8px] text-zinc-600 uppercase">Control Tower</span>
+            </button>
             <button
               type="button"
               onClick={() => fillCredentials("seller")}
@@ -80,14 +97,14 @@ export default function LoginPage() {
             </button>
             <button
               type="button"
-              onClick={() => fillCredentials("buyer")}
+              onClick={() => fillCredentials("receiver")}
               className="flex-1 flex flex-col items-center gap-1.5 p-3 border border-purple-900/40 bg-purple-950/10 hover:bg-purple-950/30 hover:border-purple-600/50 transition-all group"
             >
               <ShoppingCart className="w-4 h-4 text-purple-600 group-hover:text-purple-400" />
               <span className="text-[9px] text-purple-600 group-hover:text-purple-400 uppercase tracking-widest font-bold">
-                Buyer
+                Receiver
               </span>
-              <span className="text-[8px] text-zinc-600 uppercase">Receive Products</span>
+              <span className="text-[8px] text-zinc-600 uppercase">Read-only View</span>
             </button>
           </div>
 
@@ -102,7 +119,7 @@ export default function LoginPage() {
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 className="w-full px-3 py-2 bg-black/60 border border-cyan-900/40 text-xs text-zinc-200 placeholder:text-zinc-700 focus:outline-none focus:border-cyan-500/60 transition-colors"
-                placeholder="seller or buyer"
+                placeholder="admin, seller, receiver"
                 autoComplete="username"
                 required
               />
@@ -146,12 +163,16 @@ export default function LoginPage() {
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="flex flex-col gap-0.5">
+                <div className="text-[8px] text-emerald-700 uppercase tracking-wide">Admin / Control Tower</div>
+                <div className="text-[9px] text-zinc-500 font-mono">admin / admin123</div>
+              </div>
+              <div className="flex flex-col gap-0.5">
                 <div className="text-[8px] text-cyan-700 uppercase tracking-wide">Seller / Alice</div>
                 <div className="text-[9px] text-zinc-500 font-mono">seller / seller123</div>
               </div>
               <div className="flex flex-col gap-0.5">
-                <div className="text-[8px] text-purple-700 uppercase tracking-wide">Buyer / Bob</div>
-                <div className="text-[9px] text-zinc-500 font-mono">buyer / buyer123</div>
+                <div className="text-[8px] text-purple-700 uppercase tracking-wide">Receiver / Bob</div>
+                <div className="text-[9px] text-zinc-500 font-mono">receiver / receiver123</div>
               </div>
             </div>
           </div>

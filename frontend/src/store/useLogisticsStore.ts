@@ -108,11 +108,14 @@ interface LogisticsState {
   setActivePayload: (payload: AgentPayload) => void;
   setNotifications: (notifications: NotificationItem[]) => void;
   toggleLayer: (layer: keyof LogisticsState['layers']) => void;
-  injectDemoSignal: (signalType?: string) => void;
+  injectDemoSignal: (signalType?: string, targetShipmentId?: string) => void;
   scheduleTransport: (payload: ScheduleTransportInput) => Promise<Record<string, unknown>>;
   updateTruckGps: (shipmentId: string, lat: number, lon: number) => Promise<void>;
   notifyStakeholders: (shipmentId: string) => Promise<void>;
-  sendAgentDecision: (shipmentId: string, decision: "APPROVE" | "REJECT") => Promise<void>;
+  sendAgentDecision: (
+    shipmentId: string,
+    decision: "APPROVE" | "REJECT" | "APPROVE_REROUTE" | "SAFE_WAIT" | "ESCALATE"
+  ) => Promise<void>;
 }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -141,15 +144,17 @@ export const useLogisticsStore = create<LogisticsState>((set, get) => ({
     layers: { ...state.layers, [layer]: !state.layers[layer] }
   })),
   
-  injectDemoSignal: async (signalType = 'auto') => {
+  injectDemoSignal: async (signalType = 'auto', targetShipmentId?: string) => {
     if (get().isInjecting) return; // Prevent double-clicks
     set({ isInjecting: true });
     
     try {
+      const payload: Record<string, string> = { signal_type: signalType };
+      if (targetShipmentId) payload.target_shipment_id = targetShipmentId;
       const response = await fetch(`${API_URL}/api/inject-signal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-        body: JSON.stringify({ signal_type: signalType }),
+        body: JSON.stringify(payload),
       });
       
       if (!response.ok) {

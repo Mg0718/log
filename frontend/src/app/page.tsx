@@ -7,7 +7,7 @@ import { DataLayersPanel } from "@/components/DataLayersPanel";
 import { AgentHUD } from "@/components/AgentHUD";
 import { useLogisticsStore } from "@/store/useLogisticsStore";
 import { useAuthStore } from "@/store/useAuthStore";
-import { Package, ShoppingCart } from "lucide-react";
+import { Package, ShoppingCart, ShieldCheck } from "lucide-react";
 
 // Dynamically import the Cesium Map component to disable SSR
 const LogosGothamMap = dynamic(() => import("@/components/LogosGothamMap"), {
@@ -33,32 +33,90 @@ export default function Home() {
   const { token, role, fullName } = useAuthStore();
   const [wsConnected, setWsConnected] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
+  const intentionalCloseRef = useRef(new WeakSet<WebSocket>());
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
   const reconnectRef = useRef<() => void>(() => {});
   const router = useRouter();
+  const isAdmin = role === "admin";
+  const isSeller = role === "seller";
+
+  const hardRedirectToLogin = useCallback(() => {
+    if (typeof window === "undefined") return;
+    // Full navigation avoids stale in-memory chunk references during dev HMR.
+    window.location.replace(`/login?ts=${Date.now()}`);
+  }, []);
 
   // Redirect to login if not authenticated
   useEffect(() => {
     if (!token) {
-      router.replace("/login");
+      try {
+        router.replace("/login");
+      } catch {
+        hardRedirectToLogin();
+      }
     }
-  }, [token, router]);
+  }, [token, router, hardRedirectToLogin]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const onError = (event: ErrorEvent) => {
+      const message = String(event?.message || "");
+      const fileName = String(event?.filename || "");
+      const isChunkLoadError =
+        message.includes("ChunkLoadError") ||
+        fileName.includes("/_next/static/chunks/");
+
+      if (isChunkLoadError) {
+        hardRedirectToLogin();
+      }
+    };
+
+    window.addEventListener("error", onError);
+    return () => window.removeEventListener("error", onError);
+  }, [hardRedirectToLogin]);
+
+  const closeSocket = useCallback((socket: WebSocket | null, intentional: boolean) => {
+    if (!socket) return;
+    if (intentional) {
+      intentionalCloseRef.current.add(socket);
+    }
+    // Always silence message/error events immediately.
+    socket.onmessage = null;
+    socket.onerror = null;
+    if (socket.readyState === WebSocket.OPEN) {
+      // Clean close for an open connection.
+      socket.onopen = null;
+      socket.onclose = null;
+      socket.close();
+    } else if (socket.readyState === WebSocket.CONNECTING) {
+      // NEVER call .close() on a CONNECTING socket — browsers emit
+      // "WebSocket is closed before the connection is established" warning.
+      // Instead let it finish connecting, then close it silently in onopen.
+      socket.onopen = () => { socket.close(); };
+      socket.onclose = null;
+    } else {
+      // CLOSING or CLOSED — nothing to do.
+      socket.onopen = null;
+      socket.onclose = null;
+    }
+  }, []);
 
   const connect = useCallback(() => {
     // Don't reconnect if unmounted or not authenticated
     if (!mountedRef.current) return;
     if (!token) return;
 
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
     // Clean up any existing socket
     if (socketRef.current) {
-      socketRef.current.onopen = null;
-      socketRef.current.onmessage = null;
-      socketRef.current.onclose = null;
-      socketRef.current.onerror = null;
-      if (socketRef.current.readyState === WebSocket.OPEN || socketRef.current.readyState === WebSocket.CONNECTING) {
-        socketRef.current.close();
-      }
+      closeSocket(socketRef.current, true);
+      socketRef.current = null;
     }
 
     console.log("[WS] Connecting to", WS_URL);
@@ -66,6 +124,7 @@ export default function Home() {
     socketRef.current = socket;
 
     socket.onopen = () => {
+      if (socketRef.current !== socket) return;
       console.log("[WS] Connected");
       setWsConnected(true);
     };
@@ -85,11 +144,22 @@ export default function Home() {
     };
 
     socket.onclose = () => {
+      const intentional = intentionalCloseRef.current.has(socket);
+      intentionalCloseRef.current.delete(socket);
+
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+      }
+
+      if (intentional || !mountedRef.current) {
+        return;
+      }
+
       console.log("[WS] Disconnected");
       setWsConnected(false);
 
       // Auto-reconnect only when still authenticated and mounted
-      if (mountedRef.current && token) {
+      if (token) {
         console.log(`[WS] Reconnecting in ${RECONNECT_INTERVAL / 1000}s...`);
         reconnectTimerRef.current = setTimeout(() => {
           reconnectRef.current();
@@ -98,10 +168,13 @@ export default function Home() {
     };
 
     socket.onerror = (error) => {
+      if (intentionalCloseRef.current.has(socket) || !mountedRef.current) {
+        return;
+      }
       console.error("[WS] Error:", error);
       // onclose will fire after onerror, triggering reconnect
     };
-  }, [setShipments, setActivePayload, setNotifications]);
+  }, [closeSocket, setShipments, setActivePayload, setNotifications, token]);
 
   useEffect(() => {
     reconnectRef.current = connect;
@@ -117,13 +190,14 @@ export default function Home() {
       mountedRef.current = false;
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
       }
       if (socketRef.current) {
-        socketRef.current.onclose = null; // Prevent reconnect on intentional close
-        socketRef.current.close();
+        closeSocket(socketRef.current, true);
+        socketRef.current = null;
       }
     };
-  }, [connect, token]);
+  }, [closeSocket, connect, token]);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-black p-2 gap-2">
@@ -150,16 +224,18 @@ export default function Home() {
 
             <div className="flex items-center gap-4">
                 {/* Role badge */}
-                <div className={`bg-black/80 border px-3 py-1 flex items-center gap-2 ${role === "seller" ? "border-cyan-900/40" : "border-purple-900/40"}`}>
-                    {role === "seller"
-                      ? <Package className="w-3 h-3 text-cyan-500" />
-                      : <ShoppingCart className="w-3 h-3 text-purple-400" />
+                <div className={`bg-black/80 border px-3 py-1 flex items-center gap-2 ${isAdmin ? "border-emerald-900/40" : isSeller ? "border-cyan-900/40" : "border-purple-900/40"}`}>
+                    {isAdmin
+                      ? <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                      : isSeller
+                        ? <Package className="w-3 h-3 text-cyan-500" />
+                        : <ShoppingCart className="w-3 h-3 text-purple-400" />
                     }
                     <div className="flex flex-col">
                       <div className="text-[8px] text-zinc-500 uppercase font-bold">
-                        {role === "seller" ? "Seller" : "Buyer"}
+                        {isAdmin ? "Admin" : isSeller ? "Seller" : "Receiver"}
                       </div>
-                      <div className={`text-[10px] font-bold uppercase ${role === "seller" ? "text-cyan-400" : "text-purple-400"}`}>
+                      <div className={`text-[10px] font-bold uppercase ${isAdmin ? "text-emerald-400" : isSeller ? "text-cyan-400" : "text-purple-400"}`}>
                         {fullName || role}
                       </div>
                     </div>

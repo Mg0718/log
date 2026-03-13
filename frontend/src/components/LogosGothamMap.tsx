@@ -22,6 +22,8 @@ export default function LogosGothamMap() {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<Cesium.Viewer | null>(null);
   const hasInitialFocusRef = useRef(false);
+  const hasFittedShipmentsRef = useRef(false);
+  const lastAgentFocusKeyRef = useRef<string>("");
   const { shipments, disruptions, activePayload } = useLogisticsStore();
 
   const focusOperationalArea = (viewer: Cesium.Viewer, routeOrPoints: [number, number][]) => {
@@ -224,7 +226,7 @@ export default function LogosGothamMap() {
       }
     });
 
-    if (shipments.length > 0 && !activePayload) {
+    if (shipments.length > 0 && !activePayload && !hasFittedShipmentsRef.current) {
       const focusPoints = shipments.flatMap((shipment) => {
         const points = shipment.currentRoute?.slice(0, 10) ?? [];
         if (points.length > 0) {
@@ -237,6 +239,7 @@ export default function LogosGothamMap() {
       });
       if (focusPoints.length > 0) {
         focusOperationalArea(viewer, focusPoints);
+        hasFittedShipmentsRef.current = true;
       }
     }
 
@@ -306,11 +309,22 @@ export default function LogosGothamMap() {
 
     // Focus on the disruption or impacted shipment when the agent is active.
     if (activePayload && (activePayload.agent === "RiskAnalyst" || activePayload.agent === "ActionComposer")) {
+      const eventKey = activePayload.agent === "RiskAnalyst"
+        ? `${activePayload.agent}:${activePayload.event.id}`
+        : `${activePayload.agent}:${activePayload.shipment_id}:${disruptions[disruptions.length - 1]?.id || "none"}`;
+
+      if (lastAgentFocusKeyRef.current === eventKey) {
+        return () => {
+          window.clearTimeout(minorRoadTimer);
+        };
+      }
+
       const eventPolygon = activePayload.agent === "RiskAnalyst"
         ? activePayload.event.polygonGeoJSON[0]
         : disruptions[disruptions.length - 1]?.polygonGeoJSON?.[0];
       const center = eventPolygon?.[0];
       if (center) {
+        lastAgentFocusKeyRef.current = eventKey;
         viewer.camera.flyTo({
             destination: Cesium.Cartesian3.fromDegrees(center[0], center[1], 120000),
             orientation: {
