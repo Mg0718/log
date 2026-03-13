@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from schema import CostImpact
+from backend.models.schema import CostImpact
 
 
 def _safe_number(value: float, default: float = 0.0) -> float:

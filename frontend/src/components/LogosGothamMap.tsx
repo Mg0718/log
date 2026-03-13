@@ -5,9 +5,13 @@ import * as Cesium from "cesium";
 import "cesium/Source/Widgets/widgets.css";
 import { useLogisticsStore } from "@/store/useLogisticsStore";
 
+type CesiumWindow = Window & typeof globalThis & {
+  CESIUM_BASE_URL?: string;
+};
+
 // Cesium needs to know where its assets are
 if (typeof window !== "undefined") {
-    (window as any).CESIUM_BASE_URL = "/cesium";
+    (window as CesiumWindow).CESIUM_BASE_URL = "/cesium";
     // Set global tokens if available
     if (process.env.NEXT_PUBLIC_CESIUM_ION_TOKEN) {
         Cesium.Ion.defaultAccessToken = process.env.NEXT_PUBLIC_CESIUM_ION_TOKEN;
@@ -17,19 +21,76 @@ if (typeof window !== "undefined") {
 export default function LogosGothamMap() {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<Cesium.Viewer | null>(null);
+  const hasInitialFocusRef = useRef(false);
   const { shipments, disruptions, activePayload } = useLogisticsStore();
+
+  const focusOperationalArea = (viewer: Cesium.Viewer, routeOrPoints: [number, number][]) => {
+    if (!routeOrPoints.length) {
+      viewer.camera.setView({
+        destination: Cesium.Cartesian3.fromDegrees(78.9629, 20.5937, 3200000),
+        orientation: {
+          heading: 0,
+          pitch: Cesium.Math.toRadians(-32),
+          roll: 0,
+        },
+      });
+      return;
+    }
+
+    const lons = routeOrPoints.map((point) => point[0]);
+    const lats = routeOrPoints.map((point) => point[1]);
+    const west = Math.min(...lons);
+    const east = Math.max(...lons);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+    const rectangle = Cesium.Rectangle.fromDegrees(west - 2, south - 2, east + 2, north + 2);
+    viewer.camera.flyTo({
+      destination: rectangle,
+      orientation: {
+        heading: 0,
+        pitch: Cesium.Math.toRadians(-35),
+        roll: 0,
+      },
+      duration: 1.2,
+    });
+  };
+
+  const splitRouteByRoadTier = (route: [number, number][]) => {
+    if (route.length <= 2) {
+      return { major: route, minor: [] as [number, number][] };
+    }
+
+    const majorStep = route.length > 50 ? 7 : 4;
+    const major: [number, number][] = [];
+    const minor: [number, number][] = [];
+
+    route.forEach((coord, idx) => {
+      const isEndpoint = idx === 0 || idx === route.length - 1;
+      const isMajorWaypoint = idx % majorStep === 0;
+      if (isEndpoint || isMajorWaypoint) {
+        major.push(coord);
+      } else {
+        minor.push(coord);
+      }
+    });
+
+    if (major.length < 2) {
+      return { major: route, minor: [] as [number, number][] };
+    }
+    return { major, minor };
+  };
 
   // 1. Initialize Viewer
   useEffect(() => {
     if (!containerRef.current) return;
 
-    // 2. Initialize the viewer synchronously. By default, this uses Bing Maps Satellite imagery!
+    // 2. Initialize the viewer — all stock UI disabled for clean tactical look
     const viewer = new Cesium.Viewer(containerRef.current, {
-      timeline: true,           // Shows the time slider at the bottom
-      animation: true,          // Shows the play/pause controls
-      baseLayerPicker: false,   // Hides the map-style switcher to keep the UI clean
-      geocoder: false,          // Hides the search bar
-      homeButton: false,        // Hides the home button
+      timeline: false,
+      animation: false,
+      baseLayerPicker: false,
+      geocoder: false,
+      homeButton: false,
       navigationHelpButton: false,
       fullscreenButton: false,
       vrButton: false,
@@ -37,17 +98,50 @@ export default function LogosGothamMap() {
       sceneModePicker: false,
       selectionIndicator: false,
       scene3DOnly: true,
-      shadows: true,
+      shadows: false,
+      // Satellite imagery — ESRI World Imagery (free, no API key required)
+      baseLayer: new Cesium.ImageryLayer(
+        new Cesium.UrlTemplateImageryProvider({
+          url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+          maximumLevel: 19,
+          credit: "Tiles © Esri — Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye",
+        })
+      ),
     });
 
-    // Dark mode aesthetics for background but satellite for globe
-    viewer.scene.backgroundColor = Cesium.Color.fromCssColorString("#050505");
-    viewer.scene.globe.depthTestAgainstTerrain = true;
+    // Hide Cesium logo / attribution bar
+    (viewer.cesiumWidget.creditContainer as HTMLElement).style.display = "none";
 
-    // Lock camera over India
-    viewer.camera.flyTo({
-      destination: Cesium.Cartesian3.fromDegrees(78.9629, 20.5937, 4500000),
-      duration: 0, // 0 means instant snap on load
+    // Keep the tactical UI, but let the globe read like a normal Earth.
+    viewer.scene.backgroundColor = Cesium.Color.fromCssColorString("#02070d");
+    viewer.scene.globe.depthTestAgainstTerrain = true;
+    viewer.scene.globe.show = true;
+    viewer.scene.globe.enableLighting = false;
+    viewer.scene.globe.showGroundAtmosphere = true;
+    if (viewer.scene.skyAtmosphere) {
+      viewer.scene.skyAtmosphere.show = true;
+    }
+    if (viewer.scene.skyBox) {
+      viewer.scene.skyBox.show = true;
+    }
+
+    // Note: Satellite imagery looks best with natural colours and slight darkening.
+    const imageryLayer = viewer.imageryLayers.get(0);
+    if (imageryLayer) {
+        imageryLayer.brightness = 0.85;
+        imageryLayer.contrast = 1.05;
+        imageryLayer.saturation = 1.0;  // Full colour — satellite view
+        imageryLayer.gamma = 0.9;
+    }
+
+    // Force a visible Earth viewport on first paint.
+    viewer.camera.setView({
+      destination: Cesium.Cartesian3.fromDegrees(78.9629, 20.5937, 3200000),
+      orientation: {
+        heading: 0,
+        pitch: Cesium.Math.toRadians(-32),
+        roll: 0,
+      },
     });
 
     viewerRef.current = viewer;
@@ -57,7 +151,11 @@ export default function LogosGothamMap() {
       try {
         const terrainProvider = await Cesium.createWorldTerrainAsync();
         if (viewerRef.current && !viewerRef.current.isDestroyed()) {
-            viewerRef.current.terrainProvider = terrainProvider;
+          viewerRef.current.terrainProvider = terrainProvider;
+          if (!hasInitialFocusRef.current) {
+            hasInitialFocusRef.current = true;
+            focusOperationalArea(viewerRef.current, []);
+          }
         }
       } catch (error) {
         console.error("Failed to load 3D terrain:", error);
@@ -81,15 +179,22 @@ export default function LogosGothamMap() {
     // Clear existing dynamic entities
     viewer.entities.removeAll();
 
+    const deferredMinorRoads: Array<{ id: string; points: [number, number][]; riskScore: number }> = [];
+
     // Render Shipments
     shipments.forEach((shp) => {
+      // Use real GPS coordinates if present; fall back to first route point
+      const truckLon = shp.currentLon ?? shp.currentRoute[0]?.[0];
+      const truckLat = shp.currentLat ?? shp.currentRoute[0]?.[1];
+      const routePoints = shp.currentRoute as [number, number][];
+      const { major, minor } = splitRouteByRoadTier(routePoints);
       viewer.entities.add({
         id: shp.id,
         name: shp.cargo,
-        position: Cesium.Cartesian3.fromDegrees(shp.currentRoute[0][0], shp.currentRoute[0][1]),
+        position: Cesium.Cartesian3.fromDegrees(truckLon, truckLat),
         point: {
-          pixelSize: 10,
-          color: shp.riskScore > 50 ? Cesium.Color.RED : Cesium.Color.CYAN,
+          pixelSize: 12,
+          color: shp.riskScore > 50 ? Cesium.Color.RED : Cesium.Color.fromCssColorString("#00FFFF"),
           outlineColor: Cesium.Color.BLACK,
           outlineWidth: 2,
         },
@@ -103,12 +208,58 @@ export default function LogosGothamMap() {
           fillColor: Cesium.Color.WHITE,
         },
         polyline: {
-          positions: Cesium.Cartesian3.fromDegreesArray(shp.currentRoute.flat()),
-          width: 2,
-          material: shp.riskScore > 50 ? Cesium.Color.RED.withAlpha(0.5) : Cesium.Color.CYAN.withAlpha(0.3),
+          positions: Cesium.Cartesian3.fromDegreesArray(major.flat()),
+          width: 6,
+          material: new Cesium.PolylineGlowMaterialProperty({
+            glowPower: 0.25,
+            color: shp.riskScore > 50
+              ? Cesium.Color.fromCssColorString("#ff2244")
+              : Cesium.Color.fromCssColorString("#00ffcc"),
+          }),
         }
       });
+
+      if (minor.length > 1) {
+        deferredMinorRoads.push({ id: shp.id, points: minor, riskScore: shp.riskScore });
+      }
     });
+
+    if (shipments.length > 0 && !activePayload) {
+      const focusPoints = shipments.flatMap((shipment) => {
+        const points = shipment.currentRoute?.slice(0, 10) ?? [];
+        if (points.length > 0) {
+          return points as [number, number][];
+        }
+        if (shipment.currentLon !== undefined && shipment.currentLat !== undefined) {
+          return [[shipment.currentLon, shipment.currentLat] as [number, number]];
+        }
+        return [];
+      });
+      if (focusPoints.length > 0) {
+        focusOperationalArea(viewer, focusPoints);
+      }
+    }
+
+    // Defer fine-grained route detail so major corridors appear first.
+    const minorRoadTimer = window.setTimeout(() => {
+      if (!viewerRef.current || viewerRef.current.isDestroyed()) return;
+      deferredMinorRoads.forEach((segment) => {
+        viewer.entities.add({
+          id: `${segment.id}-minor-road`,
+          name: `${segment.id} Secondary Road Detail`,
+          polyline: {
+            positions: Cesium.Cartesian3.fromDegreesArray(segment.points.flat()),
+            width: 2,
+            material: new Cesium.PolylineGlowMaterialProperty({
+              glowPower: 0.1,
+              color: segment.riskScore > 50
+                ? Cesium.Color.fromCssColorString("#ff2244").withAlpha(0.45)
+                : Cesium.Color.fromCssColorString("#00ffcc").withAlpha(0.35),
+            }),
+          },
+        });
+      });
+    }, 180);
 
     // Render Disruption Polygons as 3D Volumes
     disruptions.forEach((evt) => {
@@ -118,30 +269,63 @@ export default function LogosGothamMap() {
             name: evt.type,
             polygon: {
                 hierarchy: Cesium.Cartesian3.fromDegreesArray(flatCoords),
-                extrudedHeight: evt.severity * 1000,
-                material: evt.type === "FLOOD" 
-                    ? Cesium.Color.BLUE.withAlpha(0.4) 
-                    : Cesium.Color.ORANGE.withAlpha(0.4),
+                height: 0,
+                extrudedHeight: Math.max(evt.severity * 1500, 5000),
+                material: evt.type === "FLOOD"
+                    ? Cesium.Color.fromCssColorString("#0055ff").withAlpha(0.3)
+                    : Cesium.Color.fromCssColorString("#ff6600").withAlpha(0.3),
                 outline: true,
-                outlineColor: Cesium.Color.WHITE.withAlpha(0.5),
+                outlineColor: evt.type === "FLOOD"
+                    ? Cesium.Color.fromCssColorString("#00aaff").withAlpha(0.95)
+                    : Cesium.Color.fromCssColorString("#ff3300").withAlpha(0.95),
+                outlineWidth: 2,
             }
         });
     });
 
-    // Cinematic Camera Fly-to on Payload
-    if (activePayload && activePayload.agent === "RiskAnalyst") {
-        const evt = activePayload.event;
-        const center = evt.polygonGeoJSON[0][0];
+    // Render RouteOptimizer alternate polyline on map
+    if (activePayload && activePayload.agent === "RouteOptimizer") {
+        const alts = activePayload.calculated_alternatives;
+        alts.forEach((alt, idx) => {
+            if (alt.route_polyline && alt.route_polyline.length > 1) {
+                viewer.entities.add({
+                    id: `alt-route-${alt.option_id}-${idx}`,
+                    name: `Alternate Route ${alt.option_id}`,
+                    polyline: {
+                        positions: Cesium.Cartesian3.fromDegreesArray(alt.route_polyline.flat()),
+                        width: 5,
+                        material: new Cesium.PolylineGlowMaterialProperty({
+                            glowPower: 0.3,
+                            color: Cesium.Color.fromCssColorString("#FACC15"),
+                        }),
+                    },
+                });
+            }
+        });
+    }
+
+    // Focus on the disruption or impacted shipment when the agent is active.
+    if (activePayload && (activePayload.agent === "RiskAnalyst" || activePayload.agent === "ActionComposer")) {
+      const eventPolygon = activePayload.agent === "RiskAnalyst"
+        ? activePayload.event.polygonGeoJSON[0]
+        : disruptions[disruptions.length - 1]?.polygonGeoJSON?.[0];
+      const center = eventPolygon?.[0];
+      if (center) {
         viewer.camera.flyTo({
-            destination: Cesium.Cartesian3.fromDegrees(center[0], center[1], 15000),
+            destination: Cesium.Cartesian3.fromDegrees(center[0], center[1], 120000),
             orientation: {
-                heading: Cesium.Math.toRadians(0),
-                pitch: Cesium.Math.toRadians(-45),
+                heading: Cesium.Math.toRadians(15),
+                pitch: Cesium.Math.toRadians(-40),
                 roll: 0
             },
             duration: 3
         });
+      }
     }
+
+    return () => {
+      window.clearTimeout(minorRoadTimer);
+    };
   }, [shipments, disruptions, activePayload]);
 
   return (

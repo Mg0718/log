@@ -4,7 +4,9 @@ import os
 import re
 from typing import Any
 
-from schema import (
+import requests
+
+from backend.models.schema import (
     AgentState,
     CostImpact,
     DelayPrediction,
@@ -16,7 +18,7 @@ from schema import (
     RouteOptimizationResult,
     Shipment,
 )
-from skills.calculators import (
+from backend.services.skills.calculators import (
     calculate_cost_impact,
     calculate_optimization_score,
     calculate_risk_score,
@@ -116,15 +118,39 @@ def _safe_forecast_from_text(signal_text: str) -> ForecastedDisruption:
 
 
 def _get_llm():
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        return None
-    try:
-        from langchain_groq import ChatGroq
+    """
+    Return the best available LLM client.
+    Priority:
+      1. Google Gemini (free tier) — set GEMINI_API_KEY from aistudio.google.com
+      2. Groq (free tier) — set GROQ_API_KEY from console.groq.com
+      3. None — pipeline continues with deterministic fallback (no LLM required)
+    """
+    # 1. Google Gemini free tier
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if gemini_key:
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
 
-        return ChatGroq(model=DEFAULT_GROQ_MODEL, api_key=api_key, temperature=0)
-    except Exception:
-        return None
+            return ChatGoogleGenerativeAI(
+                model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+                google_api_key=gemini_key,
+                temperature=0,
+            )
+        except Exception:
+            pass
+
+    # 2. Groq free tier fallback
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
+        try:
+            from langchain_groq import ChatGroq
+
+            return ChatGroq(model=DEFAULT_GROQ_MODEL, api_key=groq_key, temperature=0)
+        except Exception:
+            pass
+
+    # 3. No key configured — deterministic fallback handles everything
+    return None
 
 
 def pre_disruption_detection_agent(state: AgentState) -> AgentState:
@@ -241,6 +267,13 @@ def route_optimization_agent(state: AgentState) -> AgentState:
         base_eta = shipment.original_eta_hours or max(shipment.remaining_distance_km / 45.0, 1.0)
         route_overlap = state.risk_assessment.route_overlap or 1.0
 
+        external_route = _query_route_provider(shipment)
+        provider_note = "heuristic"
+        if external_route is not None:
+            base_distance = _safe_float(external_route["distance_km"], default=base_distance, lower=1.0)
+            base_eta = _safe_float(external_route["eta_hours"], default=base_eta, lower=0.1)
+            provider_note = external_route.get("provider", "external")
+
         candidate_specs = [
             {
                 "route_id": "route-a",
@@ -248,7 +281,7 @@ def route_optimization_agent(state: AgentState) -> AgentState:
                 "eta_hours": _safe_float(base_eta + (delay * 0.65), default=base_eta, lower=0.0),
                 "risk_score": _safe_float(state.risk_assessment.risk_score * 0.7, default=state.risk_assessment.risk_score, lower=0.0),
                 "fuel_cost": _safe_float((base_distance * 1.08) * shipment.fuel_rate, default=0.0, lower=0.0),
-                "notes": "Moderate detour with lower corridor exposure.",
+                "notes": f"Moderate detour with lower corridor exposure ({provider_note} baseline).",
             },
             {
                 "route_id": "route-b",
@@ -256,7 +289,7 @@ def route_optimization_agent(state: AgentState) -> AgentState:
                 "eta_hours": _safe_float(base_eta + (delay * 0.45), default=base_eta, lower=0.0),
                 "risk_score": _safe_float(max(0.1, state.risk_assessment.risk_score * (0.5 if disruption.eta_hours > 0 else 0.8)), default=state.risk_assessment.risk_score, lower=0.0),
                 "fuel_cost": _safe_float((base_distance * 1.18) * shipment.fuel_rate, default=0.0, lower=0.0),
-                "notes": "Faster detour with higher fuel burn but lower exposure.",
+                "notes": f"Faster detour with higher fuel burn but lower exposure ({provider_note} baseline).",
             },
         ]
 
@@ -288,12 +321,13 @@ def route_optimization_agent(state: AgentState) -> AgentState:
             selected_route=selected_route,
             explanation=(
                 "Route Optimization Agent evaluated at least two alternate routes using "
-                "Optimization Score = (ETA * 0.4) + (Risk * 0.3) + (Fuel Cost * 0.3)."
+                "Optimization Score = (ETA * 0.4) + (Risk * 0.3) + (Fuel Cost * 0.3). "
+                f"Route baseline source: {provider_note}."
             ),
         )
         return _append_reason(
             state,
-            f"Route Optimization Agent selected {selected_route.route_name} with score {selected_route.optimization_score}.",
+            f"Route Optimization Agent selected {selected_route.route_name} with score {selected_route.optimization_score} (provider={provider_note}).",
         )
     except Exception:
         default_route = RouteCandidate()
@@ -303,6 +337,106 @@ def route_optimization_agent(state: AgentState) -> AgentState:
             explanation="Route optimization failed, so a default route object was returned.",
         )
         return _append_reason(state, "Route Optimization Agent failed safely and returned default route options.")
+
+
+def _query_route_provider(shipment: Shipment) -> dict[str, float | str] | None:
+    """
+    Try live route engines (MapmyIndia/OpenRouteService) for ETA + distance baseline.
+    Falls back to None when providers are unavailable.
+    """
+    current_lat = _safe_float(getattr(shipment, "current_lat", 0.0), default=0.0, lower=-90.0, upper=90.0)
+    current_lon = _safe_float(getattr(shipment, "current_lon", 0.0), default=0.0, lower=-180.0, upper=180.0)
+
+    # Destination lookup from known city list if available.
+    destination_lat, destination_lon = 0.0, 0.0
+    try:
+        from backend.services.layer3_knowledge import get_city_coords_or_none
+
+        maybe_dest = get_city_coords_or_none(getattr(shipment, "destination", ""))
+        if maybe_dest:
+            destination_lat, destination_lon = maybe_dest
+    except Exception:
+        pass
+
+    if destination_lat == 0.0 and destination_lon == 0.0:
+        return None
+
+    # MapmyIndia attempt (when API key configured). Endpoint availability may vary by plan.
+    mappls_key = os.getenv("MAPPLS_REST_API_KEY", "").strip()
+    if mappls_key:
+        try:
+            url = (
+                "https://apis.mappls.com/advancedmaps/v1/"
+                f"{mappls_key}/route_adv/driving/"
+                f"{current_lon},{current_lat};{destination_lon},{destination_lat}"
+            )
+            resp = requests.get(url, timeout=6)
+            if resp.status_code == 200:
+                payload = resp.json()
+                routes = payload.get("routes") or payload.get("route") or []
+                if routes:
+                    route = routes[0]
+                    dist_km = _safe_float(route.get("distance", 0.0) / 1000.0, default=0.0, lower=0.0)
+                    eta_h = _safe_float(route.get("duration", 0.0) / 3600.0, default=0.0, lower=0.0)
+                    if dist_km > 0 and eta_h >= 0:
+                        return {"provider": "mapmyindia", "distance_km": dist_km, "eta_hours": eta_h}
+        except Exception:
+            pass
+
+    # OpenRouteService attempt (when API key configured).
+    ors_key = os.getenv("OPENROUTESERVICE_API_KEY", "").strip()
+    if ors_key:
+        try:
+            url = "https://api.openrouteservice.org/v2/directions/driving-car/json"
+            body = {
+                "coordinates": [
+                    [current_lon, current_lat],
+                    [destination_lon, destination_lat],
+                ]
+            }
+            resp = requests.post(
+                url,
+                headers={
+                    "Authorization": ors_key,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=6,
+            )
+            if resp.status_code == 200:
+                payload = resp.json()
+                routes = payload.get("routes", [])
+                if routes:
+                    summary = routes[0].get("summary", {})
+                    dist_km = _safe_float(summary.get("distance", 0.0) / 1000.0, default=0.0, lower=0.0)
+                    eta_h = _safe_float(summary.get("duration", 0.0) / 3600.0, default=0.0, lower=0.0)
+                    if dist_km > 0 and eta_h >= 0:
+                        return {"provider": "openrouteservice", "distance_km": dist_km, "eta_hours": eta_h}
+        except Exception:
+            pass
+
+    return None
+
+
+def risk_analyst_agent(state: AgentState) -> AgentState:
+    """Layer 4 Agent 1: RiskAnalyst."""
+    state = pre_disruption_detection_agent(state)
+    state = risk_analysis_agent(state)
+    state = delay_prediction_agent(state)
+    return _append_reason(state, "RiskAnalyst completed forecast + risk + delay analysis.")
+
+
+def route_optimizer_agent(state: AgentState) -> AgentState:
+    """Layer 4 Agent 2: RouteOptimizer."""
+    state = route_optimization_agent(state)
+    return _append_reason(state, "RouteOptimizer completed alternate route scoring and selection.")
+
+
+def action_composer_agent(state: AgentState) -> AgentState:
+    """Layer 4 Agent 3: ActionComposer."""
+    state = cost_impact_agent(state)
+    state = action_recommendation_agent(state)
+    return _append_reason(state, "ActionComposer produced final recommendation payload.")
 
 
 def cost_impact_agent(state: AgentState) -> AgentState:
@@ -353,7 +487,8 @@ def action_recommendation_agent(state: AgentState) -> AgentState:
         actions.append(f"Use selected route: {state.route_optimization.selected_route.route_name}")
 
         reasoning_log = (
-            f"Shipment {state.raw_inputs.shipment.shipment_id} was evaluated through six agents. "
+            "LangGraph Agent Chain: RiskAnalyst -> RouteOptimizer -> ActionComposer. "
+            f"Shipment {state.raw_inputs.shipment.shipment_id} was evaluated through this 3-agent flow. "
             f"The system forecast a {state.forecasted_disruption.event_type} disruption near {state.forecasted_disruption.location} "
             f"with {state.forecasted_disruption.probability}% probability and severity {state.forecasted_disruption.severity}. "
             f"Risk was classified as {state.risk_assessment.risk_level} from the required severity-overlap-priority formula. "
@@ -361,7 +496,8 @@ def action_recommendation_agent(state: AgentState) -> AgentState:
             f"{state.delay_prediction.confidence_score}% confidence. "
             f"The selected route is {state.route_optimization.selected_route.route_name}, chosen by the lowest optimization score. "
             f"Estimated total cost under disruption is {state.cost_impact.total_estimated_cost}. "
-            f"Recommended actions were generated deterministically to keep the frontend contract stable."
+            f"Recommended actions were generated deterministically to keep the frontend contract stable. "
+            f"Reasoning trace: {' | '.join(state.reasoning_steps)}"
         )
 
         state.recommended_actions = actions
@@ -391,19 +527,13 @@ def build_graph():
         return _FallbackGraph()
 
     graph = StateGraph(AgentState)
-    graph.add_node("PreDisruptionDetectionAgent", pre_disruption_detection_agent)
-    graph.add_node("RiskAnalysisAgent", risk_analysis_agent)
-    graph.add_node("DelayPredictionAgent", delay_prediction_agent)
-    graph.add_node("RouteOptimizationAgent", route_optimization_agent)
-    graph.add_node("CostImpactAgent", cost_impact_agent)
-    graph.add_node("ActionRecommendationAgent", action_recommendation_agent)
-    graph.set_entry_point("PreDisruptionDetectionAgent")
-    graph.add_edge("PreDisruptionDetectionAgent", "RiskAnalysisAgent")
-    graph.add_edge("RiskAnalysisAgent", "DelayPredictionAgent")
-    graph.add_edge("DelayPredictionAgent", "RouteOptimizationAgent")
-    graph.add_edge("RouteOptimizationAgent", "CostImpactAgent")
-    graph.add_edge("CostImpactAgent", "ActionRecommendationAgent")
-    graph.add_edge("ActionRecommendationAgent", END)
+    graph.add_node("RiskAnalyst", risk_analyst_agent)
+    graph.add_node("RouteOptimizer", route_optimizer_agent)
+    graph.add_node("ActionComposer", action_composer_agent)
+    graph.set_entry_point("RiskAnalyst")
+    graph.add_edge("RiskAnalyst", "RouteOptimizer")
+    graph.add_edge("RouteOptimizer", "ActionComposer")
+    graph.add_edge("ActionComposer", END)
     return graph.compile()
 
 
@@ -411,12 +541,9 @@ class _FallbackGraph:
     def invoke(self, initial_state: AgentState) -> AgentState:
         state = initial_state
         for node in (
-            pre_disruption_detection_agent,
-            risk_analysis_agent,
-            delay_prediction_agent,
-            route_optimization_agent,
-            cost_impact_agent,
-            action_recommendation_agent,
+            risk_analyst_agent,
+            route_optimizer_agent,
+            action_composer_agent,
         ):
             try:
                 state = node(state)

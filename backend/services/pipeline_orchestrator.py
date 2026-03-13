@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 
-from layer1_ingestion import get_raw_signals
-from layer2_processing import SignalProcessor
-from layer3_knowledge import ShipmentKnowledgeModel
+from backend.services.layer1_ingestion import get_raw_signals
+from backend.services.layer2_processing import SignalProcessor
+from backend.services.layer3_knowledge import ShipmentKnowledgeModel
 
 
 def run_pipeline() -> dict:

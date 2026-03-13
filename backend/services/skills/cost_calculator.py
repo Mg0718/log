@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from schema import CostSummary, Disruption, RouteOption, Shipment
+from backend.models.schema import CostSummary, Disruption, RouteOption, Shipment
 
 
 def calculate_business_impact(

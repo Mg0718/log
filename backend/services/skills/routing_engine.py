@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from schema import Disruption, RouteOption, Shipment
+from backend.models.schema import Disruption, RouteOption, Shipment
 
 
 def find_alternate_route(shipment: Shipment, disruption: Disruption, proactive: bool) -> RouteOption:

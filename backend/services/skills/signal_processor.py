@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from schema import Disruption
+from backend.models.schema import Disruption
 
 DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
